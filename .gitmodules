@@ -1,3 +1,6 @@
 [submodule "mast3r-research"]
 	path = mast3r-research
 	url = https://github.com/naver/MASt3R.git
+[submodule "bullet3"]
+	path = bullet3
+	url = https://github.com/bulletphysics/bullet3.git
