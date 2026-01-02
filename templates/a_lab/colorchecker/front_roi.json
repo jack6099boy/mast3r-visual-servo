@@ -1,0 +1,43 @@
+{
+  "version": "1.0",
+  "image_metadata": {
+    "width": 1280,
+    "height": 720,
+    "filename": "front.jpg"
+  },
+  "polygons": [
+    {
+      "label": "target",
+      "points": [
+        [
+          120.0,
+          116.8
+        ],
+        [
+          89.6,
+          486.4
+        ],
+        [
+          662.4,
+          483.2
+        ],
+        [
+          646.4,
+          123.2
+        ],
+        [
+          121.6,
+          118.4
+        ],
+        [
+          120.0,
+          116.8
+        ]
+      ],
+      "metadata": {
+        "annotated_by": "user",
+        "timestamp": "2024-01-01T00:00:00Z"
+      }
+    }
+  ]
+}

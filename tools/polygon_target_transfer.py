@@ -11,6 +11,12 @@
 用法：
     python polygon_target_transfer.py --template <template.jpg> --target <target.jpg> \
         --polygon "[[x1,y1],[x2,y2],...]" --target_point "[x,y]"
+
+可複用模組函數：
+    - load_mast3r_model(device) - 載入 MASt3R 模型
+    - compute_matches(model, img1_path, img2_path, device, size) - 計算特徵匹配點
+    - filter_matches_in_polygon(matches_im0, matches_im1, polygon) - 過濾多邊形內的匹配點
+    - visualize_transfer(...) - 視覺化轉移結果
 """
 
 import matplotlib
@@ -24,26 +30,189 @@ import json
 import argparse
 import sys
 from pathlib import Path
+from typing import Dict, Any, Tuple, List, Optional
 
 # Add mast3r-research to Python path
 MAST3R_PATH = Path(__file__).parent.parent / 'mast3r-research'
 sys.path.insert(0, str(MAST3R_PATH))
 
-from mast3r.model import AsymmetricMASt3R
-from mast3r.fast_nn import fast_reciprocal_NNs
-from dust3r.inference import inference
-from dust3r.utils.image import load_images
+try:
+    from mast3r.model import AsymmetricMASt3R
+    from mast3r.fast_nn import fast_reciprocal_NNs
+    from dust3r.inference import inference
+    from dust3r.utils.image import load_images
+    MAST3R_AVAILABLE = True
+except ImportError as e:
+    print(f"MASt3R import error: {e}")
+    MAST3R_AVAILABLE = False
+    AsymmetricMASt3R = None
+    fast_reciprocal_NNs = None
+    inference = None
+    load_images = None
 
 
-def point_in_polygon(point, polygon):
+# =============================================================================
+# 獨立可複用函數 (模組化 API)
+# =============================================================================
+
+def load_mast3r_model(device: str = 'mps', model_name: str = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"):
+    """
+    載入 MASt3R 模型
+    
+    Args:
+        device: 計算設備 ('mps', 'cuda', 'cpu')
+        model_name: HuggingFace 模型名稱
+        
+    Returns:
+        model: 載入的 MASt3R 模型
+        
+    Raises:
+        ImportError: 若 MASt3R 不可用
+    """
+    if not MAST3R_AVAILABLE:
+        raise ImportError("MASt3R is not available. Please install it first.")
+    
+    print(f"載入 MASt3R 模型中... (device={device})")
+    model = AsymmetricMASt3R.from_pretrained(model_name).to(device).eval()
+    print("MASt3R 模型載入完成")
+    return model
+
+
+def compute_matches(model, img1_path: str, img2_path: str, device: str = 'mps', 
+                    size: int = 512, use_original_coords: bool = True) -> Dict[str, Any]:
+    """
+    計算兩張圖片的特徵匹配點
+    
+    Args:
+        model: MASt3R 模型
+        img1_path: 第一張圖片路徑 (template)
+        img2_path: 第二張圖片路徑 (target)
+        device: 計算設備
+        size: MASt3R 處理尺寸 (default: 512)
+        use_original_coords: 是否轉換為原圖座標 (若 False，返回 512x512 座標)
+        
+    Returns:
+        dict: {
+            'matches_im0': np.ndarray [N, 2] - img1 上的匹配點座標
+            'matches_im1': np.ndarray [N, 2] - img2 上的匹配點座標
+            'img0_shape': (H, W) - img1 原始尺寸
+            'img1_shape': (H, W) - img2 原始尺寸
+            'view1': dict - MASt3R view1 資訊
+            'view2': dict - MASt3R view2 資訊
+        }
+    """
+    if not MAST3R_AVAILABLE:
+        raise ImportError("MASt3R is not available. Please install it first.")
+    
+    # 載入影像並執行推論
+    images = load_images([str(img1_path), str(img2_path)], size=size)
+    output = inference([tuple(images)], model, device, batch_size=1, verbose=False)
+    
+    view1, pred1 = output['view1'], output['pred1']
+    view2, pred2 = output['view2'], output['pred2']
+    
+    # 提取描述符並進行匹配
+    desc1 = pred1['desc'].squeeze(0).detach()
+    desc2 = pred2['desc'].squeeze(0).detach()
+    
+    matches_im0, matches_im1 = fast_reciprocal_NNs(
+        desc1, desc2, subsample_or_initxy1=8,
+        device=device, dist='dot', block_size=2**13
+    )
+    
+    # 轉為 numpy
+    if hasattr(matches_im0, 'cpu'):
+        matches_im0 = matches_im0.cpu().numpy()
+    if hasattr(matches_im1, 'cpu'):
+        matches_im1 = matches_im1.cpu().numpy()
+    
+    matches_im0 = np.asarray(matches_im0, dtype=np.float32)
+    matches_im1 = np.asarray(matches_im1, dtype=np.float32)
+    
+    # 獲取原圖尺寸 (使用 cv2 直接讀取，避免 true_shape 的問題)
+    # 注意: view['true_shape'] 返回的是處理後尺寸，不是原圖尺寸
+    img0 = cv2.imread(str(img1_path))
+    img1 = cv2.imread(str(img2_path))
+    H0, W0 = img0.shape[:2]
+    H1, W1 = img1.shape[:2]
+    
+    if use_original_coords:
+        # 計算縮放比例和 padding，轉換為原圖座標
+        size_f = float(size)
+        
+        # img0 (template)
+        scale0 = size_f / max(H0, W0)
+        resized_h0 = H0 * scale0
+        resized_w0 = W0 * scale0
+        pad_top0 = (size_f - resized_h0) / 2
+        pad_left0 = (size_f - resized_w0) / 2
+        
+        # img1 (target)
+        scale1 = size_f / max(H1, W1)
+        resized_h1 = H1 * scale1
+        resized_w1 = W1 * scale1
+        pad_top1 = (size_f - resized_h1) / 2
+        pad_left1 = (size_f - resized_w1) / 2
+        
+        # 邊緣過濾 (在處理後座標系統)
+        valid0 = (matches_im0[:, 0] >= 3) & (matches_im0[:, 0] < size_f - 3) & \
+                 (matches_im0[:, 1] >= 3) & (matches_im0[:, 1] < size_f - 3)
+        valid1 = (matches_im1[:, 0] >= 3) & (matches_im1[:, 0] < size_f - 3) & \
+                 (matches_im1[:, 1] >= 3) & (matches_im1[:, 1] < size_f - 3)
+        valid = valid0 & valid1
+        matches0_proc = matches_im0[valid]
+        matches1_proc = matches_im1[valid]
+        
+        # 轉換為原圖座標 (去除 padding 並反向縮放)
+        orig_x0 = (matches0_proc[:, 0] - pad_left0) / scale0
+        orig_y0 = (matches0_proc[:, 1] - pad_top0) / scale0
+        orig_x1 = (matches1_proc[:, 0] - pad_left1) / scale1
+        orig_y1 = (matches1_proc[:, 1] - pad_top1) / scale1
+        
+        orig_pts0 = np.stack([orig_x0, orig_y0], axis=1)
+        orig_pts1 = np.stack([orig_x1, orig_y1], axis=1)
+        
+        # 邊界檢查 (在原圖座標系統)
+        valid_orig0 = (orig_pts0[:, 0] >= 0) & (orig_pts0[:, 0] < W0) & \
+                      (orig_pts0[:, 1] >= 0) & (orig_pts0[:, 1] < H0)
+        valid_orig1 = (orig_pts1[:, 0] >= 0) & (orig_pts1[:, 0] < W1) & \
+                      (orig_pts1[:, 1] >= 0) & (orig_pts1[:, 1] < H1)
+        valid_orig = valid_orig0 & valid_orig1
+        
+        matches_im0 = orig_pts0[valid_orig]
+        matches_im1 = orig_pts1[valid_orig]
+    
+    return {
+        'matches_im0': matches_im0,
+        'matches_im1': matches_im1,
+        'img0_shape': (H0, W0),
+        'img1_shape': (H1, W1),
+        'view1': view1,
+        'view2': view2
+    }
+
+
+def point_in_polygon(point, polygon) -> bool:
     """檢查點是否在多邊形內"""
     polygon_np = np.array(polygon, dtype=np.float32)
     result = cv2.pointPolygonTest(polygon_np, (float(point[0]), float(point[1])), False)
     return result >= 0
 
 
-def filter_matches_in_polygon(matches_im0, matches_im1, polygon):
-    """過濾在多邊形內的匹配點"""
+def filter_matches_in_polygon(matches_im0: np.ndarray, matches_im1: np.ndarray, 
+                               polygon: List[List[float]]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    過濾在多邊形內的匹配點
+    
+    Args:
+        matches_im0: [N, 2] img0 上的匹配點座標
+        matches_im1: [N, 2] img1 上的匹配點座標
+        polygon: 多邊形頂點 [[x1, y1], [x2, y2], ...]
+        
+    Returns:
+        filtered_im0: 在多邊形內的 img0 匹配點
+        filtered_im1: 對應的 img1 匹配點
+    """
     polygon_np = np.array(polygon, dtype=np.float32)
     mask = []
     for pt in matches_im0:
@@ -52,6 +221,125 @@ def filter_matches_in_polygon(matches_im0, matches_im1, polygon):
     mask = np.array(mask)
     return matches_im0[mask], matches_im1[mask]
 
+
+def visualize_transfer(img0_path: str, img1_path: str, 
+                        polygon_src: np.ndarray, polygon_dst: Optional[np.ndarray],
+                        matches_in_roi: Tuple[np.ndarray, np.ndarray],
+                        target_point_src: Optional[np.ndarray] = None,
+                        target_point_dst: Optional[Tuple[float, float]] = None,
+                        output_path: str = 'transfer_result.png',
+                        title_info: str = '',
+                        use_processed_images: bool = False,
+                        view1: Optional[Dict] = None,
+                        view2: Optional[Dict] = None):
+    """
+    視覺化轉移結果
+    
+    Args:
+        img0_path: template 影像路徑
+        img1_path: target 影像路徑
+        polygon_src: 源多邊形頂點 [[x1, y1], ...]
+        polygon_dst: 目標多邊形頂點 (可選)
+        matches_in_roi: (matches_im0, matches_im1) 在 ROI 內的匹配點
+        target_point_src: 源目標點 [x, y] (可選)
+        target_point_dst: 轉換後目標點 (x, y) (可選)
+        output_path: 輸出圖片路徑
+        title_info: 額外標題資訊
+        use_processed_images: 是否使用 MASt3R 處理後的影像 (需提供 view1, view2)
+        view1, view2: MASt3R view 物件 (若 use_processed_images=True)
+    """
+    if use_processed_images and view1 is not None and view2 is not None:
+        # 使用 MASt3R 處理後的影像
+        image_mean = torch.as_tensor([0.5, 0.5, 0.5]).reshape(1, 3, 1, 1)
+        image_std = torch.as_tensor([0.5, 0.5, 0.5]).reshape(1, 3, 1, 1)
+        
+        img_template = (view1['img'] * image_std + image_mean).squeeze(0).permute(1, 2, 0).cpu().numpy()
+        img_target = (view2['img'] * image_std + image_mean).squeeze(0).permute(1, 2, 0).cpu().numpy()
+        
+        img_template = np.clip(img_template, 0, 1)
+        img_target = np.clip(img_target, 0, 1)
+    else:
+        # 使用原圖
+        img_template = cv2.imread(str(img0_path))
+        img_target = cv2.imread(str(img1_path))
+        img_template = cv2.cvtColor(img_template, cv2.COLOR_BGR2RGB) / 255.0
+        img_target = cv2.cvtColor(img_target, cv2.COLOR_BGR2RGB) / 255.0
+    
+    matches_template, matches_target = matches_in_roi
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # Left: Template + polygon + target point
+    axes[0].imshow(img_template)
+    poly_patch = patches.Polygon(polygon_src, linewidth=2, edgecolor='lime', facecolor='lime', alpha=0.2)
+    axes[0].add_patch(poly_patch)
+    if target_point_src is not None:
+        axes[0].plot(target_point_src[0], target_point_src[1], 'r*', markersize=20, 
+                     markeredgecolor='white', markeredgewidth=2)
+    axes[0].set_title(f'Template\nPolygon ROI + Target Point (red star)', fontsize=12)
+    axes[0].axis('off')
+    
+    # Middle: Match lines
+    h1, w1 = img_template.shape[:2]
+    h2, w2 = img_target.shape[:2]
+    
+    max_h = max(h1, h2)
+    combined = np.zeros((max_h, w1 + w2, 3))
+    combined[:h1, :w1] = img_template
+    combined[:h2, w1:] = img_target
+    
+    axes[1].imshow(combined)
+    
+    n_show = min(30, len(matches_template))
+    if n_show > 0:
+        indices = np.linspace(0, len(matches_template) - 1, n_show).astype(int)
+        cmap = plt.get_cmap('jet')
+        for i, idx in enumerate(indices):
+            x0, y0 = matches_template[idx]
+            x1, y1 = matches_target[idx]
+            color = cmap(i / max(n_show - 1, 1))
+            axes[1].plot([x0, x1 + w1], [y0, y1], '-', color=color, linewidth=1, alpha=0.7)
+            axes[1].plot(x0, y0, '+', color=color, markersize=6)
+            axes[1].plot(x1 + w1, y1, '+', color=color, markersize=6)
+    
+    axes[1].set_title(f'Matches in ROI ({len(matches_template)}, showing {n_show})\n{title_info}', fontsize=11)
+    axes[1].axis('off')
+    
+    # Right: Target + transformed target point or polygon
+    axes[2].imshow(img_target)
+    
+    if polygon_dst is not None:
+        poly_patch_dst = patches.Polygon(polygon_dst, linewidth=2, edgecolor='lime', facecolor='lime', alpha=0.2)
+        axes[2].add_patch(poly_patch_dst)
+    
+    if target_point_dst is not None:
+        if isinstance(target_point_dst, dict) and 'epiline' in target_point_dst:
+            # Draw epiline for fundamental matrix
+            epiline = target_point_dst['epiline']
+            a, b, c = epiline
+            x_vals = np.array([0, w2])
+            if abs(b) > 1e-10:
+                y_vals = (-a * x_vals - c) / b
+                axes[2].plot(x_vals, y_vals, 'r-', linewidth=2, label='Epiline')
+            axes[2].set_title(f'Target\nEpiline (red line)', fontsize=12)
+        else:
+            axes[2].plot(target_point_dst[0], target_point_dst[1], 'r*', markersize=20,
+                         markeredgecolor='white', markeredgewidth=2)
+            axes[2].set_title(f'Target\nTransformed Point (red star)\n({target_point_dst[0]:.1f}, {target_point_dst[1]:.1f})', fontsize=12)
+    else:
+        axes[2].set_title('Target\nTransferred ROI', fontsize=12)
+    
+    axes[2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Visualization saved to: {output_path}")
+    plt.close()
+
+
+# =============================================================================
+# 幾何變換函數
+# =============================================================================
 
 def compute_transform(src_pts, dst_pts, method='partial', ransac_thresh=5.0):
     """
@@ -179,7 +467,13 @@ def compute_reprojection_error(M, src_pts, dst_pts, method='affine'):
     return np.mean(errors) if errors else float('inf'), np.std(errors) if errors else 0
 
 
+# =============================================================================
+# 類別封裝 (保持向後相容)
+# =============================================================================
+
 class PolygonTargetTransfer:
+    """多邊形目標點轉換器 (使用獨立函數的封裝類別)"""
+    
     def __init__(self, device='mps'):
         self.device = device
         self.model = None
@@ -187,49 +481,22 @@ class PolygonTargetTransfer:
     def load_model(self):
         """載入 MASt3R 模型"""
         if self.model is None:
-            print("載入 MASt3R 模型中...")
-            model_name = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
-            self.model = AsymmetricMASt3R.from_pretrained(model_name).to(self.device)
+            self.model = load_mast3r_model(self.device)
         return self.model
     
     def get_matches(self, template_path, target_path, size=512):
         """獲取 template 和 target 之間的匹配點"""
         model = self.load_model()
+        result = compute_matches(model, template_path, target_path, self.device, size)
         
-        images = load_images([template_path, target_path], size=size)
-        output = inference([tuple(images)], model, self.device, batch_size=1, verbose=True)
-        
-        view1, pred1 = output['view1'], output['pred1']
-        view2, pred2 = output['view2'], output['pred2']
-        
-        desc1 = pred1['desc'].squeeze(0).detach()
-        desc2 = pred2['desc'].squeeze(0).detach()
-        
-        matches_im0, matches_im1 = fast_reciprocal_NNs(
-            desc1, desc2, subsample_or_initxy1=8,
-            device=self.device, dist='dot', block_size=2**13
-        )
-        
-        # 轉為 numpy
-        if hasattr(matches_im0, 'cpu'):
-            matches_im0 = matches_im0.cpu().numpy()
-        if hasattr(matches_im1, 'cpu'):
-            matches_im1 = matches_im1.cpu().numpy()
-        
-        matches_im0 = np.asarray(matches_im0, dtype=np.float32)
-        matches_im1 = np.asarray(matches_im1, dtype=np.float32)
-        
-        # 獲取縮放比例 (原圖 → 處理尺寸)
-        H0, W0 = int(view1['true_shape'][0][0]), int(view1['true_shape'][0][1])
-        H1, W1 = int(view2['true_shape'][0][0]), int(view2['true_shape'][0][1])
-        
+        # 保持向後相容的返回格式
         return {
-            'matches_template': matches_im0,
-            'matches_target': matches_im1,
-            'template_shape': (H0, W0),
-            'target_shape': (H1, W1),
-            'view1': view1,
-            'view2': view2
+            'matches_template': result['matches_im0'],
+            'matches_target': result['matches_im1'],
+            'template_shape': result['img0_shape'],
+            'target_shape': result['img1_shape'],
+            'view1': result['view1'],
+            'view2': result['view2']
         }
     
     def transfer_target_point(self, template_path, target_path, polygon, target_point,
@@ -337,90 +604,22 @@ class PolygonTargetTransfer:
         }
         
         if visualize:
-            self._visualize(
-                template_path, target_path, polygon, target_point,
-                transformed_point, matches_in_poly_template, matches_in_poly_target,
-                match_result, output_path, transform_method, info
+            visualize_transfer(
+                img0_path=template_path,
+                img1_path=target_path,
+                polygon_src=polygon,
+                polygon_dst=None,
+                matches_in_roi=(matches_in_poly_template, matches_in_poly_target),
+                target_point_src=target_point,
+                target_point_dst=transformed_point,
+                output_path=output_path,
+                title_info=f"Method: {info.get('description', transform_method)}",
+                use_processed_images=True,
+                view1=match_result['view1'],
+                view2=match_result['view2']
             )
         
         return result
-    
-    def _visualize(self, template_path, target_path, polygon, target_point,
-                   transformed_point, matches_template, matches_target, match_result,
-                   output_path, transform_method='partial', info=None):
-        """視覺化結果"""
-        view1 = match_result['view1']
-        view2 = match_result['view2']
-        
-        image_mean = torch.as_tensor([0.5, 0.5, 0.5]).reshape(1, 3, 1, 1)
-        image_std = torch.as_tensor([0.5, 0.5, 0.5]).reshape(1, 3, 1, 1)
-        
-        img_template = (view1['img'] * image_std + image_mean).squeeze(0).permute(1, 2, 0).cpu().numpy()
-        img_target = (view2['img'] * image_std + image_mean).squeeze(0).permute(1, 2, 0).cpu().numpy()
-        
-        img_template = np.clip(img_template, 0, 1)
-        img_target = np.clip(img_target, 0, 1)
-        
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        
-        # Left: Template + polygon + target point
-        axes[0].imshow(img_template)
-        poly_patch = patches.Polygon(polygon, linewidth=2, edgecolor='lime', facecolor='lime', alpha=0.2)
-        axes[0].add_patch(poly_patch)
-        axes[0].plot(target_point[0], target_point[1], 'r*', markersize=20, markeredgecolor='white', markeredgewidth=2)
-        axes[0].set_title(f'Template\nPolygon ROI + Target Point (red star)', fontsize=12)
-        axes[0].axis('off')
-        
-        # Middle: Match lines
-        h1, w1 = img_template.shape[:2]
-        h2, w2 = img_target.shape[:2]
-        
-        max_h = max(h1, h2)
-        combined = np.zeros((max_h, w1 + w2, 3))
-        combined[:h1, :w1] = img_template
-        combined[:h2, w1:] = img_target
-        
-        axes[1].imshow(combined)
-        
-        n_show = min(30, len(matches_template))
-        if n_show > 0:
-            indices = np.linspace(0, len(matches_template) - 1, n_show).astype(int)
-            cmap = plt.get_cmap('jet')
-            for i, idx in enumerate(indices):
-                x0, y0 = matches_template[idx]
-                x1, y1 = matches_target[idx]
-                color = cmap(i / max(n_show - 1, 1))
-                axes[1].plot([x0, x1 + w1], [y0, y1], '-', color=color, linewidth=1, alpha=0.7)
-                axes[1].plot(x0, y0, '+', color=color, markersize=6)
-                axes[1].plot(x1 + w1, y1, '+', color=color, markersize=6)
-        
-        method_name = info.get('description', transform_method) if info else transform_method
-        axes[1].set_title(f'Matches ({len(matches_template)}, showing {n_show})\nMethod: {method_name}', fontsize=11)
-        axes[1].axis('off')
-        
-        # Right: Target + transformed target point (or epiline for fundamental)
-        axes[2].imshow(img_target)
-        
-        if transform_method == 'fundamental' and isinstance(transformed_point, dict):
-            # Draw epiline
-            epiline = transformed_point['epiline']
-            a, b, c = epiline
-            # y = (-a*x - c) / b
-            x_vals = np.array([0, w2])
-            if abs(b) > 1e-10:
-                y_vals = (-a * x_vals - c) / b
-                axes[2].plot(x_vals, y_vals, 'r-', linewidth=2, label='Epiline')
-            axes[2].set_title(f'Target\nEpiline (red line)\nFundamental Matrix', fontsize=12)
-        else:
-            axes[2].plot(transformed_point[0], transformed_point[1], 'r*', markersize=20,
-                         markeredgecolor='white', markeredgewidth=2)
-            axes[2].set_title(f'Target\nTransformed Point (red star)\n({transformed_point[0]:.1f}, {transformed_point[1]:.1f})', fontsize=12)
-        axes[2].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Visualization saved to: {output_path}")
-        plt.close()
 
 
 def main():
