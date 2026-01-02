@@ -1,0 +1,3 @@
+[submodule "mast3r-research"]
+	path = mast3r-research
+	url = https://github.com/naver/MASt3R.git

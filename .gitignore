@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+mast3r-env/
+venv/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Model Checkpoints (太大，不上傳)
+checkpoints/
+*.pth
+*.safetensors
+*.ckpt
+*.pt
+
+# Hugging Face Cache
+.cache/
+~/.cache/huggingface/
+
+# 測試輸出 (可選擇性保留)
+matches.png
+transfer_result.png
+transfer_partial.png
+transfer_affine.png
+transfer_homography.png
+*.glb
+
+# 測試影像 (本地測試用)
+images.jpeg
+img_test.png
+
+# 暫存文件
+tmp/
+temp/
+*.tmp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Log files
+*.log
+logs/
+
+# 大型測試資料 (可選)
+data/
+datasets/
+
+# Roo 配置 (本地開發用)
+.roo/
+.roomodes
+
+# mast3r-research 中的本地開發副本 (主要版本在 tools/)
+mast3r-research/test_pairwise_mast3r.py
+mast3r-research/polygon_target_transfer.py
+mast3r-research/ARCHITECTURE.md
