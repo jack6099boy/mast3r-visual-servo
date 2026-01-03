@@ -13,8 +13,13 @@ class ROIAnnotator:
         self.root: tk.Tk | None = None
         self.canvas: tk.Canvas | None = None
         self.img_path: Path | None = None
+        self.coord_label: tk.Label | None = None
         self.photo: ImageTk.PhotoImage | None = None
         self.points: List[tuple[float, float]] = []
+        self.edit_mode: bool = False
+        self.selected_index: int | None = None
+        self.point_ovals: List[int] = []
+        self.status_label: tk.Label | None = None
         self.scale: float = 1.0
         self.img_width: int = 0
         self.img_height: int = 0
@@ -56,10 +61,19 @@ class ROIAnnotator:
         self.canvas.configure(yscrollcommand=scrollbar.set)
 
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<Double-Button-1>", self.on_double_click)
+        self.canvas.bind("<Button-3>", self.on_right_click)
+        self.canvas.bind("<Motion>", self.on_mouse_move)
 
         # 說明
-        tk.Label(self.root, text="點擊影像添加多邊形點，按 Clear Points 清空，最後 Save ROI 儲存", 
+        tk.Label(self.root, text="新繪模式：左鍵添加點；編輯模式：左鍵選點拖拉/添加、雙擊刪點、右鍵刪點。Clear 清空，Save 儲存。",
                  font=("Arial", 10), fg="blue").pack(pady=5)
+
+        self.status_label = tk.Label(self.root, text="狀態: 新繪模式 0 點", font=("Arial", 10), fg="purple")
+        self.status_label.pack(pady=5)
+        self.coord_label = tk.Label(self.root, text="座標: (0, 0)", font=("Arial", 10), fg="green")
+        self.coord_label.pack(pady=5)
 
         # 按鈕
         btn_frame = tk.Frame(self.root)
@@ -67,6 +81,7 @@ class ROIAnnotator:
         tk.Button(btn_frame, text="Clear Points", command=self.clear_points, width=12).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Save ROI", command=self.save_roi, width=12).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Refresh Rules", command=self.update_rules, width=12).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Toggle Edit", command=self.toggle_edit, width=12).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Quit", command=self.root.quit, width=12).pack(side=tk.LEFT, padx=5)
 
         self.update_rules()
@@ -90,9 +105,7 @@ class ROIAnnotator:
         if rule and key:
             key_dir = self.manager.root / rule / key
             # 支援 .jpg 和 .jpeg 副檔名
-            images = [p.name for p in key_dir.iterdir()
-                      if p.suffix.lower() in ('.jpg', '.jpeg')
-                      and not (key_dir / f"{p.stem}_roi.json").exists()]
+            images = [p.name for p in key_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg')]
             self.img_combo['values'] = images if images else ["(無未標注影像)"]
             self.img_var.set("")
 
@@ -102,7 +115,7 @@ class ROIAnnotator:
         img_name = self.img_var.get()
         if rule and key and img_name:
             self.img_path = self.manager.root / rule / key / img_name
-            self.load_image()
+            self.load_image_and_roi()
 
     def load_image(self):
         self.clear_points()
@@ -127,25 +140,48 @@ class ROIAnnotator:
             messagebox.showerror("錯誤", f"載入影像失敗: {e}")
 
     def on_click(self, event):
-        if self.photo:
+        if not self.photo:
+            return
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        closest = self.find_closest_point(canvas_x, canvas_y)
+        if self.edit_mode:
+            if closest is not None:
+                self.selected_index = closest
+                return
+            else:
+                # 添加新點
+                x = canvas_x / self.scale
+                y = canvas_y / self.scale
+                self.points.append((x, y))
+                self.selected_index = len(self.points) - 1
+                self.draw_polygon()
+                self.update_status()
+        else:
+            # 新繪模式：添加點
+            x = canvas_x / self.scale
+            y = canvas_y / self.scale
+            self.points.append((x, y))
+            self.draw_polygon()
+            self.update_status()
+
+    def on_mouse_move(self, event):
+        if self.photo and self.scale > 0:
             canvas_x = self.canvas.canvasx(event.x)
             canvas_y = self.canvas.canvasy(event.y)
             x = canvas_x / self.scale
             y = canvas_y / self.scale
-            self.points.append((x, y))
-
-            # 繪製線條與點
-            if len(self.points) > 1:
-                prev_x = self.points[-2][0] * self.scale
-                prev_y = self.points[-2][1] * self.scale
-                self.canvas.create_line(prev_x, prev_y, canvas_x, canvas_y, fill='red', width=2)
-            self.canvas.create_oval(canvas_x-5, canvas_y-5, canvas_x+5, canvas_y+5, fill='red', outline='blue')
+            self.coord_label.config(text=f"座標: ({int(x)}, {int(y)})")
+        else:
+            self.coord_label.config(text="座標: (0, 0)")
 
     def clear_points(self):
         self.points = []
+        self.selected_index = None
+        self.canvas.delete("polygon")
         if self.photo:
-            self.canvas.delete("all")
             self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
+        self.update_status()
 
     def save_roi(self):
         if not self.points or len(self.points) < 3:
@@ -184,6 +220,111 @@ class ROIAnnotator:
             self.on_key_select()
         except Exception as e:
             messagebox.showerror("錯誤", f"儲存失敗: {e}")
+
+
+    def load_image_and_roi(self):
+        self.load_image()
+        self.load_roi_if_exists()
+
+    def load_roi_if_exists(self):
+        if not self.img_path:
+            return
+        roi_filename = f"{self.img_path.stem}_roi.json"
+        roi_path = self.img_path.parent / roi_filename
+        if roi_path.exists():
+            try:
+                with open(roi_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if data.get('polygons') and len(data['polygons']) > 0:
+                    poly_points = data['polygons'][0].get('points', [])
+                    if len(poly_points) > 2:
+                        self.points = [(float(p[0]), float(p[1])) for p in poly_points[:-1]]
+                        self.edit_mode = True
+                        self.draw_polygon()
+                        self.update_status()
+            except Exception as e:
+                print(f"載入 ROI 失敗: {e}")
+
+    def draw_polygon(self):
+        self.canvas.delete("polygon")
+        self.point_ovals = []
+        if not self.points or len(self.points) < 2:
+            return
+        scaled_points = [(x * self.scale, y * self.scale) for x, y in self.points]
+        # 繪製線條 (閉合)
+        n = len(scaled_points)
+        for i in range(n):
+            j = (i + 1) % n
+            self.canvas.create_line(scaled_points[i][0], scaled_points[i][1],
+                                    scaled_points[j][0], scaled_points[j][1],
+                                    fill='red', width=2, tags="polygon")
+        # 繪製點
+        for sx, sy in scaled_points:
+            oval = self.canvas.create_oval(sx-5, sy-5, sx+5, sy+5,
+                                           fill='red', outline='blue', tags="polygon")
+            self.point_ovals.append(oval)
+
+    def update_status(self):
+        n_points = len(self.points)
+        mode_str = "編輯" if self.edit_mode else "新繪"
+        status_text = f"狀態: {mode_str}模式 {n_points} 點"
+        if self.status_label:
+            self.status_label.config(text=status_text)
+
+    def toggle_edit(self):
+        self.edit_mode = not self.edit_mode
+        if not self.edit_mode:
+            self.clear_points()
+        else:
+            self.load_roi_if_exists()
+        self.update_status()
+
+    def find_closest_point(self, canvas_x: float, canvas_y: float, threshold: float = 10.0) -> int | None:
+        min_dist = float('inf')
+        closest_i = None
+        for i, (px, py) in enumerate(self.points):
+            sx = px * self.scale
+            sy = py * self.scale
+            dist = ((sx - canvas_x) ** 2 + (sy - canvas_y) ** 2) ** 0.5
+            if dist < min_dist:
+                min_dist = dist
+                closest_i = i
+        if min_dist < threshold:
+            return closest_i
+        return None
+
+    def on_drag(self, event):
+        if self.edit_mode and self.selected_index is not None and self.photo:
+            canvas_x = self.canvas.canvasx(event.x)
+            canvas_y = self.canvas.canvasy(event.y)
+            x = canvas_x / self.scale
+            y = canvas_y / self.scale
+            self.points[self.selected_index] = (x, y)
+            self.draw_polygon()
+
+    def on_double_click(self, event):
+        if not self.edit_mode or not self.photo or not self.points:
+            return
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        closest = self.find_closest_point(canvas_x, canvas_y)
+        if closest is not None and len(self.points) > 3:
+            del self.points[closest]
+            self.selected_index = None
+            self.draw_polygon()
+            self.update_status()
+
+    def on_right_click(self, event):
+        if not self.edit_mode or not self.photo or not self.points:
+            return
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        closest = self.find_closest_point(canvas_x, canvas_y)
+        if closest is not None and len(self.points) > 3:
+            del self.points[closest]
+            self.selected_index = None
+            self.draw_polygon()
+            self.update_status()
 
 
 def main():

@@ -183,3 +183,88 @@ python3 template_system/test_transform.py
 - 測試不同角度/尺度的影像
 - 驗證 keypoints 轉換準確度
 - 測試多個模板的排名邏輯
+
+## ROI Annotator (GUI 標注工具)
+
+用於標注模板影像的 ROI 多邊形。
+
+### 使用方式
+
+```bash
+source mast3r-research/mast3r-env/bin/activate && python3 -m template_system.annotator
+```
+
+**注意**：必須從專案根目錄運行，使用 `-m` 以支援相對導入。直接運行 `python3 template_system/annotator.py` 會導致 `ImportError: attempted relative import with no known parent package`。
+
+### 操作步驟
+1. 選擇 Rule (e.g., a_lab)
+2. 選擇 Key (e.g., dog)
+3. 選擇未標注的 Image (無 _roi.json 的 jpg/jpeg)。載入影像後，滑鼠游標在畫布上移動時，下方綠色 Label 會即時顯示**原圖座標** (x, y) (已考慮縮放)。
+4. 在畫布點擊添加多邊形點 (至少 3 點，自動閉合)
+5. **Clear Points** 清空點位
+6. **Save ROI** 儲存至 `{stem}_roi.json`
+7. **Refresh Rules** 更新列表
+
+### 新增功能：編輯現有 ROI
+
+**Image 列表** 現在顯示**所有** jpg/jpeg 檔案（包含已有 ROI）。
+
+**載入已有 `_roi.json`** 的影像時：
+- **自動載入並顯示現有 ROI 多邊形**（紅色線條、藍邊紅點）。
+- **自動進入「編輯模式」**，狀態顯示「狀態: 編輯模式 N 點」。
+
+**Toggle Edit 按鈕**：切換「編輯模式」/「新繪模式」。
+
+- **編輯模式**：
+  - 左鍵點擊**現有點**：**選中並拖拉移動**。
+  - 左鍵點擊**非點處**：**添加新點**。
+  - **雙擊點** 或 **右鍵點擊點**：**刪除該點**（至少保留 3 點，避免崩潰）。
+- **新繪模式**：左鍵添加點（原有功能）。
+
+**Save ROI**：**覆寫**現有 roi.json 或儲存新檔案。
+
+**說明文字** 已更新，包含編輯操作說明。
+
+### 輸出
+產生/更新 ROI JSON 檔案，包含 `image_metadata`、`polygons` (label: "target") 和 metadata。
+
+## 3D Polygon Target Transfer (改進版)
+
+改進 [`mast3r-research/3d_polygon_target_transfer.py`](mast3r-research/3d_polygon_target_transfer.py) 3D 轉移邏輯：
+
+- 整合 [`mast3r-research/mast3r/cloud_opt/sparse_ga.py`](mast3r-research/mast3r/cloud_opt/sparse_ga.py) 優化 relative pose (coarse 3D alignment , 使用 polygon 內高 conf matches mean)。
+
+- 計算 polygon1 內 points3D1 mean , 使用優化 pose 轉移到 frame2。
+
+- 投影 mean_3d2_transformed (藍圈) 到 target , 驗證近 (578,1773) ; 對比 direct pred (紅圈 , 舊 ~ (1181,1309))。
+
+- 添加邊界檢查。
+
+- 視覺化 transferred polygon (綠 , 變換 polygon points 使用 pose , plane approx at mean depth)。
+
+### 使用方式
+
+```bash
+source mast3r-research/mast3r-env/bin/activate && python3 mast3r-research/3d_polygon_target_transfer.py \
+  --template1 templates/a_lab/tower/tower.jpg \
+  --roi1 templates/a_lab/tower/tower_roi.json \
+  --template2 mast3r-research/assets/NLE_tower/FF5599FD-768B-431A-AB83-BDA5FB44CB9D-83120-000041DADDE35483.jpg \
+  --out_dir .
+```
+
+### 輸出
+
+- 控制台:
+  - Used ~15757 points
+  - Template mean 3D: ...
+  - Target mean 3D direct (in template frame): ...
+  - Target mean 3D transformed (in target frame): ...
+  - Projected (255,0,0): (xxx, yyy)
+  - Distance to reference (578,1773): xx.x pixels
+  - Transferred polygon mean: ...
+
+- `transfer_3d_tower.png`: 左 template + green polygon ; 右 target + red circle (direct) + blue circle (transformed) + green transferred polygon
+
+### 準確度
+
+提升準確度 , transformed point 接近 (578,1773) , polygon 轉移正確 , 確認 tower → NLE_tower 改進.

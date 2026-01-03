@@ -60,6 +60,7 @@ transfer_partial.png
 transfer_affine.png
 transfer_homography.png
 *.glb
+output_test/
 
 # 測試影像 (本地測試用)
 images.jpeg
